@@ -3,12 +3,12 @@ CFLAGS=-Wall -Wextra -g
 LIBS=liburing/build/lib/liburing.a
 ODIR=build
 
-all: tls_server
+all: tiny_get
 
-tls_server: tls_server.o
-	$(CC) $(CFLAGS) -o $@  tls_server.o $(LIBS) -lssl -lcrypto
+tiny_get: tiny_get.o uring_buff_pool.h uring_tls.h
+	$(CC) $(CFLAGS) -o $@  tiny_get.o $(LIBS) -lssl -lcrypto
 
 .PHONY: clean
 
 clean:
-	rm -f *.o tls_server
+	rm -f *.o tiny_get

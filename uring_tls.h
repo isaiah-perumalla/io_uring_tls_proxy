@@ -49,8 +49,8 @@ enum {
 struct ssl_conn {
     int fd;
     SSL *ssl;
-    char* host_name;
     struct sockaddr_in addr_in;
+    char host_name[32];
 };
 
 

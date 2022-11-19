@@ -14,6 +14,21 @@
 #include "uring_tls.h"
 #include "uring_buff_pool.h"
 
+/**
+ * small example program tls proxy, which uses io_uring
+ * and openssl
+ * reads ip and hostname from stdin, establishes a TLS connection and then http get
+ *
+ * example usage
+ * ./tiny_get cacerts.pem
+ *
+ * > 142.250.80.36 google.com; 142.250.80.31 www.firefox.com
+ *
+ * the above in stdin will connect to both ips , establish tls connection and perform a http get
+ * prints output to stdout
+ * all running on a single thread , using io_uring for all IO operations
+ */
+
 #define BUFFER_SIZE 2048
 #define NBUFFERS 16
 #define MAX_CONNS 16
@@ -27,25 +42,59 @@ static struct fixed_buff_pool WRITE_BUFFER_POOL;
 static struct read_buff_pool READ_BUFFER_POOL;
 static struct ssl_conn CONNECTIONS[MAX_CONNS];
 
+enum {
+    STDIN_READ = 200
+};
+char stdin_buffer[1024];
+
 struct ssl_conn *get_ssl_conn(uint16_t conn_idx) {
     struct ssl_conn* conn = &CONNECTIONS[conn_idx];
     return conn;
 }
+
+
+
 int setup_socket(char *host_ip, int port, struct sockaddr_in *addr);
 
-int init_conn(char *host_ip, int port, char* host_name, __u16 conn_idx) {
-    struct ssl_conn *conn = get_ssl_conn(conn_idx);
+int init_conn(char *host_ip, int port, char* host_name, struct ssl_conn* conn) {
 
     int sock_fd = setup_socket(host_ip, port, &conn->addr_in);
     if (sock_fd < 0) {
         return -1;
     }
-
     conn->fd = sock_fd;
-    conn->host_name = host_name;
+    strcpy(&conn->host_name[0], host_name);
     return 0;
 }
+/**
+ *
+ * @param host_ip
+ * @param port
+ * @param ring
+ * @param host_name
+ * @return connection index for this connection , negative value if err
+ */
+int initiate_tls_connect(char *host_ip, int port, struct io_uring *ring, char *host_name) {
+    struct ssl_conn* conn = NULL;
+    int conn_idx = -1;
+    for(int i = 0; i < 16; i++) {
+        conn = get_ssl_conn(i);
+        if (conn->ssl == NULL) { //free for use
+            conn_idx = i;
+            break;
+        }
+    }
+    if (conn_idx == -1) {
+        return -2;
+    }
+    int err = init_conn(host_ip, port, host_name, conn);
+    if (err) {
+        return -1;
+    }
 
+    prep_connect(conn->fd, (struct sockaddr *) &conn->addr_in, sizeof(conn->addr_in), ring, conn_idx);
+    return conn_idx;
+}
 
 void prep_http_get(struct io_uring *uring, struct uring_user_data *data, struct ssl_conn *conn) {
     char *hostname = conn->host_name;
@@ -185,17 +234,70 @@ int setup_socket(char *host_ip, int port, struct sockaddr_in *addr) {
     return fd;
 }
 
+int prep_read_stdin(struct io_uring *ring, size_t offset) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+    if (sqe == NULL) {
+        return -1;
+    }
+    size_t nbytes = sizeof(stdin_buffer) - offset;
+    io_uring_prep_read(sqe, stdin->_fileno, stdin_buffer, nbytes, offset);
+    struct uring_user_data data = {
+            .conn_idx = 0,
+            .req_type = STDIN_READ
+    };
+    memcpy(&sqe->user_data, &data, sizeof(struct uring_user_data));
+    return 0;
+}
+
+
+void on_stdin(struct io_uring* ring, char* buff, size_t len) {
+
+    if (strchr(buff, '\n')) {
+
+        char *delim = " ;";
+        char *ip = strtok(buff, delim);
+        while(ip) {
+            char *hostname = strtok(NULL, delim);
+            if (hostname == NULL) break;
+            uint32_t ip_addr;
+            bool ip_valid = 1 == inet_pton(AF_INET, ip, &ip_addr);
+
+            if (ip_valid) {
+                int conn_idx = initiate_tls_connect(ip, 443, ring, hostname);
+                if (conn_idx < 0) {
+                    fprintf(stderr, "error %d, initiate_tls_connect %s, hostname %s\n",
+                            conn_idx,
+                            ip, hostname);
+                }
+                else {
+                    fprintf(stderr, "initiating connection to %s; host=%s\n", ip, hostname);
+                }
+            }
+            else {
+                fprintf(stderr, "INVALID IP ip=%s , hostname=%s \n", ip,  hostname);
+            }
+            ip = strtok(NULL, delim);
+        }
+        //clear buff
+        memset(stdin_buffer, 0, sizeof(stdin_buffer));
+        prep_read_stdin(ring, 0);
+    }
+    else {
+        prep_read_stdin(ring, len);
+    }
+
+}
 
 
 int main(int argc, char* argv[]) {
 
-    if (argc < 4) {
-        fprintf(stderr, "Usage %s HOST-ip PORT ca-certs-filename\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage %s  ca-certs-filename\n", argv[0]);
         return 1;
     }
-    char *host_ip = argv[1];
-    int port = atoi(argv[2]);
-    const char *ca_file = argv[3];
+
+    int port = 443;
+    const char *ca_file = argv[1];
 
     int ctx_err = init_ssl_ctx(ca_file);
 
@@ -221,16 +323,10 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "unable to io_uring_buf  buffers \n");
         exit(1);
     }
-    
-    err = init_conn(host_ip, port, "www.google.com", 1);
-    if (err) {
-        fprintf(stderr, "unable to create socket %s %d", host_ip, port);
-        exit(1);
-    }
-    struct ssl_conn *conn = get_ssl_conn(1);
-    prep_connect(conn->fd, (struct sockaddr *) &conn->addr_in, sizeof(conn->addr_in), &ring, 1);
 
+    prep_read_stdin(&ring, stdin->_fileno);
     struct io_uring_cqe *cqes[NCQES];
+
     while(1) {
         int ret = io_uring_submit_and_wait(&ring, 1);
         if (-EINTR == ret) continue;
@@ -241,7 +337,13 @@ int main(int argc, char* argv[]) {
         const int count = io_uring_peek_batch_cqe(&ring, &cqes[0], NCQES);
         for (int i = 0; i < count; i++) {
             struct io_uring_cqe *cqe = cqes[i];
-            process_cqe(cqe, &ring, &READ_BUFFER_POOL, &WRITE_BUFFER_POOL);
+            struct uring_user_data data;
+            memcpy(&data, &cqe->user_data, sizeof(struct uring_user_data));
+            if (data.req_type == STDIN_READ) {
+                on_stdin(&ring, &stdin_buffer[0], cqe->res);
+            } else {
+                process_cqe(cqe, &ring, &READ_BUFFER_POOL, &WRITE_BUFFER_POOL);
+            }
         }
         io_uring_cq_advance(&ring, count);
     }
