@@ -39,11 +39,13 @@
  * pool initialised in main
  */
 static struct fixed_buff_pool WRITE_BUFFER_POOL;
-static struct read_buff_pool READ_BUFFER_POOL;
+
+static struct read_buff_pool SOCK_READ_BUFFER_POOL;
 static struct ssl_conn CONNECTIONS[MAX_CONNS];
 
 enum {
-    STDIN_READ = 200
+    STDIN_READ = 200,
+    OUT_FILE_WRITE
 };
 char stdin_buffer[1024];
 
@@ -79,8 +81,9 @@ int initiate_tls_connect(char *host_ip, int port, struct io_uring *ring, char *h
     int conn_idx = -1;
     for(int i = 0; i < 16; i++) {
         conn = get_ssl_conn(i);
-        if (conn->ssl == NULL) { //free for use
+        if (conn->fd == -1) {//free for use
             conn_idx = i;
+            assert(conn->ssl == NULL && "free conn but ssl not null");
             break;
         }
     }
@@ -111,17 +114,20 @@ void prep_http_get(struct io_uring *uring, struct uring_user_data *data, struct 
     int request_length = strlen(out_buf);
     int n = SSL_write(conn->ssl, out_buf, request_length);
     assert(n == request_length);
-    void *buffer = fixed_pool_get_buffer(&WRITE_BUFFER_POOL, (*data).conn_idx);
+    void *buffer;
+
+    int buff_idx = fixed_pool_take_buffer(&WRITE_BUFFER_POOL, &buffer);
+    fprintf(stderr, "http get buffet take %d \n", buff_idx);
     BIO *write_bio = SSL_get_wbio(conn->ssl);
     int read_bytes = BIO_read(write_bio, buffer, BUFFER_SIZE);
-    prep_write(conn->fd, uring, (*data).conn_idx, DATA_WRITE, buffer, read_bytes);
+    prep_write_fixed(conn->fd, uring, (*data).conn_idx, DATA_WRITE, buffer, read_bytes, buff_idx);
 }
 
 
 void on_tls_handshake_complete(struct io_uring *uring, struct uring_user_data data) {
     struct ssl_conn *conn = &CONNECTIONS[data.conn_idx];
     prep_http_get(uring, &data, conn);
-    prep_read(conn->fd, uring, DATA_READ, data.conn_idx, READ_BUFFER_POOL.buff_size);
+    prep_read(conn->fd, uring, DATA_READ, data.conn_idx, SOCK_READ_BUFFER_POOL.buff_size);
 
 }
 
@@ -133,32 +139,55 @@ void on_tls_handshake_failed(struct io_uring *ring, struct uring_user_data tag) 
     clean_up_connection(ring, (tag).conn_idx);
 }
 
-void on_data_recv(struct io_uring *uring, struct io_uring_cqe *cqe) {
-    struct uring_user_data  data;
-    memcpy(&data, &cqe->user_data, sizeof(data));
-    struct ssl_conn *conn = &CONNECTIONS[data.conn_idx];
-    int read_bytes = cqe->res;
-    assert(read_bytes > 0 && "read bytes less than 0");
-    fprintf(stderr, "read %d bytes \n", read_bytes);
-    const unsigned short buf_idx = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
-    void *buffer = buffer_pool_get(&READ_BUFFER_POOL, buf_idx);
-    BIO *read_bio = SSL_get_rbio(conn->ssl);
-    BIO_write(read_bio, buffer, read_bytes);
-    char out_buff[2048];
-    const unsigned int max_buffer_size = READ_BUFFER_POOL.buff_size;
+int get_out_fd(__u16 idx, char* hostname) {
+    return stdout->_fileno;
+}
 
+void queue_file_write(struct io_uring *uring, int fd, char *buff, int len, __u16 conn_idx, int buff_idx) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(uring);
+    io_uring_prep_write_fixed(sqe, fd, buff, len, 0, buff_idx);
+    struct uring_user_data data = {
+            .conn_idx = conn_idx,
+            .req_type = OUT_FILE_WRITE,
+            .write_buff_idx = buff_idx
+    };
+    memset(&sqe->user_data, 0, sizeof(data));
+    memcpy(&sqe->user_data, &data, sizeof(data));
+}
+
+void on_recv_decrypted_data(struct ssl_conn* conn, __u16 conn_idx, struct io_uring *uring) {
+
+    assert(conn->ssl != NULL);
+    char b[2048];
     for(;;) {
-        int read = SSL_read(conn->ssl, out_buff, sizeof(out_buff)-1);
+        int read = SSL_read(conn->ssl, b, sizeof(b)-1);
 
         if (read <= 0) {
             //ssl  record needs more data before decrypt so schedule another read
             break;
         }
-        out_buff[read] = '\0';
-        fprintf(stdout, "%s", out_buff);
+        b[read] = '\0';
+        fprintf(stdout, "%s", b);
     }
-    buffer_pool_release(&READ_BUFFER_POOL, buf_idx);
-    prep_read(conn->fd, uring, DATA_READ, data.conn_idx, max_buffer_size);
+
+//    int fd = get_out_fd(conn_idx, conn->host_name);
+//    void* buff;
+//    int buf_idx = fixed_pool_take_buffer(&WRITE_BUFFER_POOL, &buff);
+//    fprintf(stderr, "buffer take decrypt date idx=%d \n", buf_idx);
+//    if (buf_idx < 0) {
+//        fprintf(stderr, "failed to get buffer from FILE_WRITE_BUFFER_POOL \n");
+//    }
+//    else {
+//
+//        int bytes = SSL_read(conn->ssl, buff, 2048);
+//        if (bytes <=0 ) {
+//            fprintf(stderr, "free bytes <= 0 idx=%d\n", buf_idx);
+//            fixed_pool_release(&WRITE_BUFFER_POOL, buf_idx);
+//        }
+//        else {
+//            queue_file_write(uring, fd, buff, bytes, conn_idx, buf_idx);
+//        }
+
 }
 
 void on_tcp_connect_failed(struct io_uring_cqe *cqe, struct io_uring *ring) {
@@ -180,8 +209,8 @@ void on_tcp_connect(struct io_uring_cqe *cqe, struct io_uring *ring) {
     SSL *ssl = setup_tls_client(ssl_ctx, conn->host_name);
     conn->ssl = ssl;
     assert(conn->ssl && "could not create ssl");
-    fprintf(stderr, "tcp connected %d %d \n", tag.conn_idx, tag.req_type);
-    int ret = do_ssl_handshake(cqe, ring, &READ_BUFFER_POOL, &WRITE_BUFFER_POOL);
+    fprintf(stderr, "tcp connected conn_idx=%d, %d \n", tag.conn_idx, tag.req_type);
+    int ret = do_ssl_handshake(cqe, ring, &SOCK_READ_BUFFER_POOL, &WRITE_BUFFER_POOL);
     if (ret == -1) {
         on_tls_handshake_failed(ring, tag);
         //handshake failed;
@@ -252,8 +281,9 @@ int prep_read_stdin(struct io_uring *ring, size_t offset) {
 
 void on_stdin(struct io_uring* ring, char* buff, size_t len) {
 
-    if (strchr(buff, '\n')) {
-
+    char *end_line = strchr(buff, '\n');
+    if (end_line) {
+        *end_line =  '\0'; //remove newline char
         char *delim = " ;";
         char *ip = strtok(buff, delim);
         while(ip) {
@@ -295,8 +325,13 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Usage %s  ca-certs-filename\n", argv[0]);
         return 1;
     }
-
-    int port = 443;
+    //init connections
+    size_t len = sizeof(CONNECTIONS)/ sizeof(struct ssl_conn);
+    for(size_t i = 0; i < len; i++) {
+        struct ssl_conn *conn = &CONNECTIONS[i];
+        conn->fd = -1;
+        conn->ssl = NULL;
+    }
     const char *ca_file = argv[1];
 
     int ctx_err = init_ssl_ctx(ca_file);
@@ -315,10 +350,11 @@ int main(int argc, char* argv[]) {
     }
     int err = setup_fixed_buffers(&ring, &WRITE_BUFFER_POOL, BUFFER_SIZE, NBUFFERS);
     if (err) {
-        fprintf(stderr, "unable to setup fixed buffers \n");
+        fprintf(stderr, "unable to setup WRITE_BUFFER_POOL fixed buffers \n");
         exit(1);
     }
-    err = setup_io_uring_pooled_buffers(&ring, &READ_BUFFER_POOL, BUFFER_SIZE, NBUFFERS);
+    
+    err = setup_io_uring_pooled_buffers(&ring, &SOCK_READ_BUFFER_POOL, BUFFER_SIZE, NBUFFERS);
     if (err) {
         fprintf(stderr, "unable to io_uring_buf  buffers \n");
         exit(1);
@@ -341,8 +377,16 @@ int main(int argc, char* argv[]) {
             memcpy(&data, &cqe->user_data, sizeof(struct uring_user_data));
             if (data.req_type == STDIN_READ) {
                 on_stdin(&ring, &stdin_buffer[0], cqe->res);
-            } else {
-                process_cqe(cqe, &ring, &READ_BUFFER_POOL, &WRITE_BUFFER_POOL);
+            }
+            else if (data.req_type == OUT_FILE_WRITE) {
+                fprintf(stderr, "free OUT_FILE_WRITE idx=%d \n", data.write_buff_idx);
+                fixed_pool_release(&WRITE_BUFFER_POOL, data.write_buff_idx);
+                if (cqe->res < 0) {
+                    fprintf(stderr, "error OUT_FILE_WRITE %d \n", cqe->res);
+                }
+            }
+            else {
+                process_cqe(cqe, &ring, &SOCK_READ_BUFFER_POOL, &WRITE_BUFFER_POOL);
             }
         }
         io_uring_cq_advance(&ring, count);

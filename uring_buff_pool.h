@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <signal.h>
 
+#define CHAR_BITS 8 
 
 struct read_buff_pool {
     unsigned int nbuffers;
@@ -28,15 +29,16 @@ struct fixed_buff_pool {
     unsigned int nbuffers;
     unsigned int buff_size;
     void* mem;
+    char* free_bitmap;
 };
 
 
-static void *fixed_pool_get_buffer(struct fixed_buff_pool* pool, __u16 idx) {
+static void *get_fixed_buffer(struct fixed_buff_pool* pool, __u16 idx) {
     void *buff = pool->mem + (idx * pool->buff_size);
     return buff;
 }
 
-unsigned char* buffer_pool_get(struct read_buff_pool* pool, unsigned int idx) {
+static unsigned char* buffer_pool_get(struct read_buff_pool* pool, unsigned int idx) {
     unsigned char *buff_base = (unsigned char *) pool->buff_ring +
                                sizeof(struct io_uring_buf) * pool->nbuffers;
     return buff_base + (idx * pool->buff_size);
@@ -90,6 +92,26 @@ int setup_io_uring_pooled_buffers(struct io_uring *uring, struct read_buff_pool*
     return 0;
 }
 
+int fixed_pool_take_buffer(struct fixed_buff_pool* pool, void** buff) {
+    
+    for(size_t i =0; i < pool->nbuffers; i++) {
+        char mask = (char) (1 << (i % CHAR_BIT));
+        int is_set = (pool->free_bitmap[i] & mask);
+        if (!is_set) {
+            pool->free_bitmap[i] |= mask;
+            *buff = get_fixed_buffer(pool, i);
+            return i;
+        }
+    }
+    return -1;
+}
+
+void fixed_pool_release(struct fixed_buff_pool* pool, __u16 idx) {
+    char mask = (char) (1 << (idx % CHAR_BIT));
+    pool->free_bitmap[idx] &= ~mask;
+
+}
+
 int setup_fixed_buffers(struct io_uring *uring, struct fixed_buff_pool* fixed_pool,
         __u16 buffer_size, __u16 nbuffs) {
 
@@ -112,9 +134,16 @@ int setup_fixed_buffers(struct io_uring *uring, struct fixed_buff_pool* fixed_po
         fprintf(stderr, "Error registering buffers: %s", strerror(-ret));
         return -1;
     }
+    void *free_bitmap = malloc(nbuffs / 8);
+    if (free_bitmap == NULL) {
+        fprintf(stderr, "Error register buffer bitmap \n");
+        return -1;
+    }
+    memset(free_bitmap, 0, nbuffs/8);
     fixed_pool->nbuffers = nbuffs;
     fixed_pool->buff_size = buffer_size;
     fixed_pool->mem = mem;
+    fixed_pool->free_bitmap = free_bitmap;
     return 0;
 }
 
