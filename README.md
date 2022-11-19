@@ -4,6 +4,7 @@ io_uring based TLS proxy
 ## Prerequisites
 1. Linux kernel version 6.0 or higher
 2. liburing submodule 
+3. libssl3.so is required, running the follwoing should show if it is already on machine `ldconfig -p|grep ssl`
 
 ## Build liburing
 1. `./configure --prefix=../build`
