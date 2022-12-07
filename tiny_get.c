@@ -29,7 +29,7 @@
  * all running on a single thread , using io_uring for all IO operations
  */
 
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 128
 #define NBUFFERS 16
 #define MAX_CONNS 16
 #define ENTRIES 1024
@@ -54,8 +54,7 @@ struct ssl_conn *get_ssl_conn(uint16_t conn_idx) {
     return conn;
 }
 
-
-
+int OUT_FD = -1;
 int setup_socket(char *host_ip, int port, struct sockaddr_in *addr);
 
 int init_conn(char *host_ip, int port, char* host_name, struct ssl_conn* conn) {
@@ -66,6 +65,7 @@ int init_conn(char *host_ip, int port, char* host_name, struct ssl_conn* conn) {
     }
     conn->fd = sock_fd;
     strcpy(&conn->host_name[0], host_name);
+    conn->data_written = 0;
     return 0;
 }
 /**
@@ -81,9 +81,8 @@ int initiate_tls_connect(char *host_ip, int port, struct io_uring *ring, char *h
     int conn_idx = -1;
     for(int i = 0; i < 16; i++) {
         conn = get_ssl_conn(i);
-        if (conn->fd == -1) {//free for use
+        if (ssl_conn_closed(conn) && conn->ssl == NULL) {//free for use
             conn_idx = i;
-            assert(conn->ssl == NULL && "free conn but ssl not null");
             break;
         }
     }
@@ -140,12 +139,17 @@ void on_tls_handshake_failed(struct io_uring *ring, struct uring_user_data tag) 
 }
 
 int get_out_fd(__u16 idx, char* hostname) {
+
     return stdout->_fileno;
 }
 
-void queue_file_write(struct io_uring *uring, int fd, char *buff, int len, __u16 conn_idx, int buff_idx) {
+int queue_file_write(struct io_uring *uring, int fd, char *buff, int len, __u16 conn_idx,
+        int buff_idx, size_t offset) {
     struct io_uring_sqe *sqe = io_uring_get_sqe(uring);
-    io_uring_prep_write_fixed(sqe, fd, buff, len, 0, buff_idx);
+    if (!sqe) {
+        return -1;
+    }
+    io_uring_prep_write_fixed(sqe, fd, buff, len, offset, buff_idx);
     struct uring_user_data data = {
             .conn_idx = conn_idx,
             .req_type = OUT_FILE_WRITE,
@@ -153,41 +157,36 @@ void queue_file_write(struct io_uring *uring, int fd, char *buff, int len, __u16
     };
     memset(&sqe->user_data, 0, sizeof(data));
     memcpy(&sqe->user_data, &data, sizeof(data));
+    return 0;
 }
 
+
 void on_recv_decrypted_data(struct ssl_conn* conn, __u16 conn_idx, struct io_uring *uring) {
+    if (conn->ssl == NULL) return; //SSL conntext is closed
 
-    assert(conn->ssl != NULL);
-    char b[2048];
-    for(;;) {
-        int read = SSL_read(conn->ssl, b, sizeof(b)-1);
+    int fd = get_out_fd(conn_idx, conn->host_name);
+    void *buff;
+    int buf_idx = fixed_pool_take_buffer(&WRITE_BUFFER_POOL, &buff);
+    if (buf_idx >= 0) {
 
-        if (read <= 0) {
-            //ssl  record needs more data before decrypt so schedule another read
-            break;
+        size_t read_bytes;
+        int result = SSL_read_ex(conn->ssl, buff, WRITE_BUFFER_POOL.buff_size, &read_bytes);
+        if (!result) {
+            fixed_pool_release(&WRITE_BUFFER_POOL, buf_idx);
+        } else if (read_bytes > 0) {
+            size_t offset = conn->data_written;
+            queue_file_write(uring, fd, buff, read_bytes, conn_idx, buf_idx, offset);
+            conn->data_written += read_bytes;
         }
-        b[read] = '\0';
-        fprintf(stdout, "%s", b);
+        else { //no pending bytes remaining
+            if (ssl_conn_closed(conn)) {
+                ssl_conn_destroy(conn);
+            }
+        }
+
+    } else {
+        fprintf(stderr, "failed to get buffer from FILE_WRITE_BUFFER_POOL \n");
     }
-
-//    int fd = get_out_fd(conn_idx, conn->host_name);
-//    void* buff;
-//    int buf_idx = fixed_pool_take_buffer(&WRITE_BUFFER_POOL, &buff);
-//    fprintf(stderr, "buffer take decrypt date idx=%d \n", buf_idx);
-//    if (buf_idx < 0) {
-//        fprintf(stderr, "failed to get buffer from FILE_WRITE_BUFFER_POOL \n");
-//    }
-//    else {
-//
-//        int bytes = SSL_read(conn->ssl, buff, 2048);
-//        if (bytes <=0 ) {
-//            fprintf(stderr, "free bytes <= 0 idx=%d\n", buf_idx);
-//            fixed_pool_release(&WRITE_BUFFER_POOL, buf_idx);
-//        }
-//        else {
-//            queue_file_write(uring, fd, buff, bytes, conn_idx, buf_idx);
-//        }
-
 }
 
 void on_tcp_connect_failed(struct io_uring_cqe *cqe, struct io_uring *ring) {
@@ -330,6 +329,7 @@ int main(int argc, char* argv[]) {
     for(size_t i = 0; i < len; i++) {
         struct ssl_conn *conn = &CONNECTIONS[i];
         conn->fd = -1;
+        conn->flags = 0;
         conn->ssl = NULL;
     }
     const char *ca_file = argv[1];
@@ -379,8 +379,9 @@ int main(int argc, char* argv[]) {
                 on_stdin(&ring, &stdin_buffer[0], cqe->res);
             }
             else if (data.req_type == OUT_FILE_WRITE) {
-                fprintf(stderr, "free OUT_FILE_WRITE idx=%d \n", data.write_buff_idx);
                 fixed_pool_release(&WRITE_BUFFER_POOL, data.write_buff_idx);
+                struct ssl_conn *conn = get_ssl_conn(data.conn_idx);
+                on_recv_decrypted_data(conn, data.conn_idx, &ring);
                 if (cqe->res < 0) {
                     fprintf(stderr, "error OUT_FILE_WRITE %d \n", cqe->res);
                 }

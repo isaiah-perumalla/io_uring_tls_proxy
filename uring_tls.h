@@ -46,15 +46,31 @@ enum {
     CONNECTION_CLOSED
 };
 
+typedef enum {
+    CONN_OPEN
+} SSL_FLAGS;
 
 struct ssl_conn {
     int fd;
+    int flags;
     SSL *ssl;
     struct sockaddr_in addr_in;
     char host_name[32];
+    size_t data_written;
 };
 
+bool ssl_conn_closed(struct ssl_conn* conn) {
+    return (conn->flags & (1 << CONN_OPEN)) == 0;
+}
 
+void ssl_conn_destroy(struct ssl_conn* conn) {
+    assert(conn->ssl != NULL);
+    int pending_bytes = BIO_pending(SSL_get_rbio(conn->ssl));
+    if (conn->ssl  && (pending_bytes == 0)) {
+        SSL_free(conn->ssl);
+        conn->ssl = NULL;
+    }
+}
 struct ssl_conn *get_ssl_conn(uint16_t conn_idx);
 
 
@@ -159,6 +175,7 @@ void on_data_recv(struct io_uring *uring, struct io_uring_cqe *cqe, struct read_
     struct uring_user_data  data;
     memcpy(&data, &cqe->user_data, sizeof(data));
     struct ssl_conn *conn = get_ssl_conn(data.conn_idx);
+    assert(conn->ssl != NULL && "ssl is NULL");
     int read_bytes = cqe->res;
     assert(read_bytes > 0 && "read bytes less than 0");
     fprintf(stderr, "read %d bytes \n", read_bytes);
@@ -211,7 +228,6 @@ int do_ssl_handshake(struct io_uring_cqe *cqe, struct io_uring *ring,
             void *buffer;
 
             int buf_idx = fixed_pool_take_buffer(write_buff_pool, &buffer);
-            fprintf(stderr, "hanshake take idx=%d \n", buf_idx);
             assert(buf_idx >= 0);
             int n = BIO_read(write_bio, buffer, write_buff_pool->buff_size);
             prep_write_fixed(conn->fd, ring, conn_idx, HANDSHAKE_WRITE, buffer, n, buf_idx);
@@ -247,12 +263,11 @@ void submit_close_fd(struct io_uring* ring, int conn_idx) {
 
 void clean_up_connection(struct io_uring* ring, int conn_idx) {
     struct ssl_conn *conn = get_ssl_conn(conn_idx);
-    if (conn->ssl) {
-        SSL_free(conn->ssl);
-        conn->ssl = NULL;
+    ssl_conn_destroy(conn);
+    if (!ssl_conn_closed(conn)) {
+        submit_close_fd(ring, conn_idx);
+        conn->flags &= ~(1 << CONN_OPEN);
     }
-    submit_close_fd(ring, conn_idx);
-
 }
 
 
@@ -261,7 +276,7 @@ int setup_iouring(struct io_uring *ring, __u32 ncqes, unsigned int nentries) {
     memset(&params, 0, sizeof(params));
     memset(ring, 0, sizeof((*ring)));
     params.cq_entries = ncqes;
-    params.flags = IORING_SETUP_COOP_TASKRUN  //ensure kernel doesnt interrup user thread, use this in single thread mode
+    params.flags = IORING_SETUP_COOP_TASKRUN  //ensure kernel doesnt interrupt user thread, use this in single thread mode
                    | IORING_SETUP_SUBMIT_ALL  // dont stop submit entries when error
                    | IORING_SETUP_CQSIZE; // pre-fill a buffer for cqe(s)
     int result = io_uring_queue_init_params(nentries, ring, &params);
@@ -285,13 +300,15 @@ void process_cqe(struct io_uring_cqe *cqe, struct io_uring *ring,
                 on_tcp_connect_failed(cqe, ring);
             }
             else {
+                struct ssl_conn *conn = get_ssl_conn(tag.conn_idx);
+                conn->flags |= (1 << CONN_OPEN);
                 on_tcp_connect(cqe, ring);
             }
             break;
         }
         case HANDSHAKE_WRITE: {
             assert(tag.write_buff_idx >= 0);
-            fprintf(stderr, "free HANDSHAKE_WRITE idx=%d \n", tag.write_buff_idx);
+
             fixed_pool_release(write_buff_pool, tag.write_buff_idx);
         }
         case HANDSHAKE_READ: {
@@ -316,7 +333,6 @@ void process_cqe(struct io_uring_cqe *cqe, struct io_uring *ring,
             break;
         }
         case DATA_WRITE: {
-            fprintf(stderr, "free DATA_WRITE idx=%d \n", tag.write_buff_idx);
             fixed_pool_release(write_buff_pool, tag.write_buff_idx);
             break;
         }
